@@ -38,7 +38,8 @@ def improve_placement(
 ) -> dict[int, StagePlacement]:
     """Apply local region repairs until the analytical service objective stalls.
 
-    Each iteration sweeps all stages, ranks nearby stage unions, reconstructs
+    Each iteration visits bottleneck stages and their direct I/O neighbors,
+    ranks nearby stage unions, reconstructs
     regions with and without unused tiles, and reassigns ownership. Only strict
     improvements to the complete objective are accepted, preventing cycles
     while permitting a stage group to be revisited after its neighbours move.
@@ -51,19 +52,28 @@ def improve_placement(
     has_unused_tiles = sum(
         placement.physical_submesh.num_tiles for placement in placements.values()
     ) < mesh.num_tiles
+    io_neighbors = {stage: set() for stage in stage_plans}
+    for source, destination in traffic.stage_comm:
+        io_neighbors[source].add(destination)
+        io_neighbors[destination].add(source)
     for iteration in range(max_iters):
         if current_evaluation.worst_tile_id is None:
             break
         worst_tile = current_evaluation.tile_scores[current_evaluation.worst_tile_id]
         if worst_tile.stage_id is None:
             break
-        # Visit every stage, including stages below the current bottleneck.
-        # Strict objective descent prevents cycles without permanently excluding
-        # a pair after its neighbours have moved.
+        worst_score = max(breakdown.total for breakdown in current_evaluation.stage_breakdowns.values())
+        bottlenecks = {
+            stage for stage, breakdown in current_evaluation.stage_breakdowns.items()
+            if breakdown.total == worst_score
+        }
+        focus_stages = bottlenecks | {
+            neighbor for stage in bottlenecks for neighbor in io_neighbors[stage]
+        }
         candidates: list[tuple[RepairCandidate, int]] = []
         seen: set[tuple[frozenset[int], int]] = set()
         ordered_stage_ids = sorted(
-            stage_plans,
+            focus_stages,
             key=lambda stage_id: (-current_evaluation.stage_breakdowns[stage_id].total, stage_id),
         )
         for stage_id in ordered_stage_ids:
@@ -78,8 +88,13 @@ def improve_placement(
                     candidates.append((candidate, stage_id))
                     seen.add(key)
         _debug(debug, f"[placement] iter={iteration} objective={current_evaluation.objective} "
-               f"sweep_stages={ordered_stage_ids} repair_candidates={len(candidates)}")
+               f"bottlenecks={sorted(bottlenecks)} sweep_stages={ordered_stage_ids} "
+               f"repair_candidates={len(candidates)}")
 
+        # A complete ownership map determines the objective. Reuse identical
+        # trials within this iteration; reset after any accepted placement.
+        evaluation_cache = {_placement_key(current_placements): current_evaluation}
+        cache_hits = 0
         best_trial: PlacementEvaluation | None = None
         best_placements: dict[int, StagePlacement] | None = None
         best_candidate: RepairCandidate | None = None
@@ -106,11 +121,17 @@ def improve_placement(
                     traffic,
                     stage_ids=candidate.stages,
                 )
-                evaluation = evaluator.evaluate(
-                    trial,
-                    previous=current_evaluation,
-                    moved_stage_ids=candidate.stages,
-                )
+                trial_key = _placement_key(trial)
+                if trial_key in evaluation_cache:
+                    evaluation = evaluation_cache[trial_key]
+                    cache_hits += 1
+                else:
+                    evaluation = evaluator.evaluate(
+                        trial,
+                        previous=current_evaluation,
+                        moved_stage_ids=candidate.stages,
+                    )
+                    evaluation_cache[trial_key] = evaluation
                 _debug(
                     debug,
                     "[placement] "
@@ -125,6 +146,7 @@ def improve_placement(
                     best_placements = trial
                     best_candidate = candidate
 
+        _debug(debug, f"[placement] iter={iteration} evaluation_cache_hits={cache_hits}")
         if best_trial is None or best_placements is None or best_candidate is None:
             _debug(debug, f"[placement] iter={iteration} no_improving_repair_found")
             break
@@ -137,6 +159,15 @@ def improve_placement(
             f"reason={best_candidate.reason} objective={current_evaluation.objective}",
         )
     return current_placements
+
+
+def _placement_key(placements: dict[int, StagePlacement]) -> tuple:
+    """Identify complete physical ownership with fixed Stage Plans."""
+
+    return tuple(
+        (stage, tuple(sorted(placement.virtual_to_physical.items())))
+        for stage, placement in sorted(placements.items())
+    )
 
 
 def repair_region(

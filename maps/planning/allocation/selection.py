@@ -59,18 +59,15 @@ def seed_stage_candidates(
 
 
 def candidate_tile_counts(current: int, budget: int) -> tuple[int, ...]:
-    """Probe coarse counts and their neighbors, then refine around the current size.
+    """Try every count up to twice the current allocation, within the budget."""
 
-    A linear sweep spends most analysis on large unused allocations. Powers of
-    two cross non-monotone regions, while adjacent counts refine a useful
-    allocation and permit one-tile growth or removal. Endpoints retain the
-    minimum and maximum budget choices. This is O(log budget) per sweep.
-    """
+    return tuple(range(1, min(2 * current, budget) + 1))
 
-    counts = {
-        1, budget, current - 1, current, current + 1,
-        current // 2, current * 2,
-    }
+
+def exchange_tile_counts(current: int, budget: int) -> tuple[int, ...]:
+    """Retain the original coarse probes and local refinement for exchanges."""
+
+    counts = {1, budget, current - 1, current, current + 1, current // 2, current * 2}
     count = 1
     while count <= budget:
         counts.update((count - 1, count, count + 1))
@@ -90,10 +87,12 @@ def grow_stage_candidates(
 ) -> tuple[dict[int, StageCandidate], SelectionEvaluation]:
     """Best-improvement local search over counts, layouts, and tile exchanges.
 
-    Counts are explored with logarithmic coarse probes and local refinement;
+    Counts are explored exhaustively up to twice the current allocation;
     every feasible layout at those counts is considered, including shrinking
     and same-count layout changes. Exchanges transfer a donor's released tiles
-    to another stage atomically, so a full mesh can escape an overgrown stage.
+    atomically between stages, with at least one endpoint a bottleneck stage or
+    one of its direct I/O neighbors. These stages may donate or receive from
+    any other stage, using coarse count probes and local refinement.
     Stage formation stays fixed. Strict objective descent guarantees termination;
     this neighborhood search does not guarantee the global optimum.
 
@@ -106,7 +105,12 @@ def grow_stage_candidates(
     evaluations: dict[tuple[tuple[int, int, tuple[int, int]], ...], SelectionEvaluation] = {}
     communication_cache = AllocationCommunicationCache(
         context.graph, mesh, {stage: candidate.plan for stage, candidate in selected_candidates.items()},
+        num_token_slots=analyzer.num_token_slots,
     )
+    exchange_neighbors: dict[int, set[int]] = {stage: set() for stage in selected_candidates}
+    for source, destination in communication_cache.compiler.edges:
+        exchange_neighbors[source].add(destination)
+        exchange_neighbors[destination].add(source)
 
     def evaluate(
         selection: dict[int, StageCandidate],
@@ -138,7 +142,31 @@ def grow_stage_candidates(
         return selection_objective(evaluation.metrics), _used_tile_count(selection)
 
     current_evaluation = evaluate(selected_candidates)
-    assert current_evaluation is not None
+    # Intrinsic seeding cannot know receive-ring fragmentation: FIFO sizes
+    # depend on both ends of each edge. Grow infeasible seeds before searching.
+    while current_evaluation is None:
+        overflows = communication_cache.l1_overflows(selected_candidates)
+        stage = next(iter(overflows))
+        current = selected_candidates[stage]
+        budget = mesh.num_tiles - _used_tile_count(selected_candidates) + current.plan.tile_count
+        replacement = None
+        for count in range(current.plan.tile_count + 1, budget + 1):
+            for candidate in analyzer.candidates(stage, count):
+                trial = selected_candidates | {stage: candidate}
+                result = evaluate(trial)
+                if stage not in communication_cache.l1_overflows(trial):
+                    replacement = trial, result
+                    break
+            if replacement is not None:
+                break
+        if replacement is None:
+            raise ValueError(
+                f"stage {stage} has no FIFO-inclusive L1-feasible seed within "
+                f"the available {budget} tiles; required/available={overflows[stage]}"
+            )
+        selected_candidates, current_evaluation = replacement
+        _debug(debug, f"[allocation] fifo_seed stage={stage} "
+               f"tile_count={selected_candidates[stage].plan.tile_count}")
     sweep = 0
     while True:
         sweep += 1
@@ -171,13 +199,24 @@ def grow_stage_candidates(
                     if candidate is not current:
                         consider({stage: candidate})
 
-        _debug(debug, f"[allocation] sweep={sweep} phase=tile_exchanges")
+        worst_metric = max(current_evaluation.metrics.values(), default=0)
+        bottlenecks = {
+            stage for stage, metric in current_evaluation.metrics.items()
+            if metric == worst_metric
+        }
+        exchange_stages = bottlenecks | {
+            neighbor for stage in bottlenecks for neighbor in exchange_neighbors[stage]
+        }
+        _debug(debug, f"[allocation] sweep={sweep} phase=tile_exchanges "
+               f"bottlenecks={sorted(bottlenecks)} exchange_stages={sorted(exchange_stages)}")
         for donor, current in selected_candidates.items():
-            for count in candidate_tile_counts(current.plan.tile_count, current.plan.tile_count - 1):
+            recipients = (
+                set(selected_candidates) if donor in exchange_stages else exchange_stages
+            ) - {donor}
+            for count in exchange_tile_counts(current.plan.tile_count, current.plan.tile_count - 1):
                 released = current.plan.tile_count - count
-                for recipient, recipient_current in selected_candidates.items():
-                    if recipient == donor:
-                        continue
+                for recipient in sorted(recipients):
+                    recipient_current = selected_candidates[recipient]
                     for smaller in analyzer.candidates(donor, count):
                         for larger in analyzer.candidates(
                             recipient, recipient_current.plan.tile_count + released,
@@ -336,8 +375,9 @@ def evaluate_candidate_selection(
     graph: Graph,
     communication_cache: AllocationCommunicationCache | None = None,
     objective_limit: tuple[tuple[float, ...], int] | None = None,
+    num_token_slots: int = 2,
 ) -> SelectionEvaluation | None:
-    """Evaluate a selection, or return None when it cannot beat objective_limit.
+    """Evaluate a selection, rejecting FIFO-inclusive L1 overflow or the limit.
 
     Rejection uses lower bounds only with supported integer transfer costs and
     finite non-negative weights. Without a cache or limit, pricing is complete.
@@ -347,6 +387,8 @@ def evaluate_candidate_selection(
         stage_id: candidate.plan
         for stage_id, candidate in candidates.items()
     }
+    if communication_cache is None and any(tile.memory.fifo is not None for tile in mesh.tiles):
+        communication_cache = AllocationCommunicationCache(graph, mesh, plans, num_token_slots)
     if communication_cache is not None:
         for candidate in candidates.values():
             if candidate.resident_demands is not None:
@@ -375,6 +417,8 @@ def evaluate_candidate_selection(
         else _virtual_communication_cycles(graph, mesh, plans, communication_cache, reject)
     )
     if virtual_communication is None:
+        return None
+    if communication_cache is not None and communication_cache.l1_overflows(candidates):
         return None
     return SelectionEvaluation(
         stage_breakdowns={
@@ -476,11 +520,20 @@ class AllocationCommunicationCache:
     after pricing to keep the cache proportional to tile counts, not tile pairs.
     """
 
-    def __init__(self, graph: Graph, mesh: Mesh, plans: dict[int, StagePlan]) -> None:
+    def __init__(self, graph: Graph, mesh: Mesh, plans: dict[int, StagePlan],
+                 num_token_slots: int = 2) -> None:
         from maps.planning.transitions.compile import VirtualTransitionCompiler
 
         self.mesh = mesh
+        self.has_fifo = any(tile.memory.fifo is not None for tile in mesh.tiles)
+        self.num_token_slots = num_token_slots
+        self.fifo_payloads: dict[tuple[int, int], dict[int, tuple[int, ...]]] = {}
         self.compiler = VirtualTransitionCompiler(graph, plans)
+        self.incoming_sources: dict[int, tuple[int, ...]] = {
+            stage: tuple(source for source, destination in self.compiler.edges if destination == stage)
+            for stage in plans
+        }
+        self.stage_l1_checks: dict[tuple[int, tuple[int, ...]], tuple[int, int] | None] = {}
         self.boundaries: dict[int, dict[int, dict[int, int]]] = {}
         self.edges: dict[tuple[int, int], dict[int, dict[int, int]]] = {}
         from .bounds import TransferLowerBounds
@@ -494,11 +547,60 @@ class AllocationCommunicationCache:
         key = (id(source), id(destination))
         if key not in self.edges:
             transitions = self.compiler.intermediates(source, destination)
+            if self.has_fifo:
+                payloads: dict[int, list[int]] = {}
+                for transition in transitions:
+                    for transfer in transition.transfers:
+                        payloads.setdefault(transfer.destination_virtual_tile_id, []).append(
+                            transfer.destination_subslice.num_elements * transition.tensor.elem_bytes
+                        )
+                self.fifo_payloads[key] = {tile: tuple(sizes) for tile, sizes in payloads.items()}
             self.edges[key] = _communication_cycles_for_transitions(
                 self.mesh, {source.stage_id: source, destination.stage_id: destination}, transitions,
             )
             self.priced_edges += 1
         return self.edges[key]
+
+    def l1_overflows(self, candidates: dict[int, StageCandidate]) -> dict[int, tuple[int, int]]:
+        """Check tensor/scratch bytes plus every actual generated receive ring."""
+
+        if not self.has_fifo:
+            return {}
+        overflows = {}
+        for stage, candidate in candidates.items():
+            # Receive storage depends only on this layout and its direct
+            # producers. Unrelated trial replacements cannot change it.
+            sources = self.incoming_sources[stage]
+            key = (id(candidate.plan), tuple(id(candidates[source].plan) for source in sources))
+            if key in self.stage_l1_checks:
+                overflow = self.stage_l1_checks[key]
+                if overflow is not None:
+                    overflows[stage] = overflow
+                continue
+            # The compiler retains plans alongside their identity keys.
+            self.compiler.demands(candidate.plan)
+            payloads: dict[int, list[int]] = {}
+            for source in sources:
+                src, dst = candidates[source].plan, candidate.plan
+                self.compiler.demands(src)
+                self._edge_cycles(src, dst)
+                for tile, sizes in self.fifo_payloads[id(src), id(dst)].items():
+                    payloads.setdefault(tile, []).extend(sizes)
+            overflow = None
+            for fact in candidate.tile_facts:
+                tile = self.mesh.tile_by_id(fact.tile_id)
+                fifo = tile.memory.fifo
+                if fifo is None:
+                    continue
+                required = fact.total_l1_bytes + fifo.allocation_bytes(
+                    payloads.get(fact.tile_id, ()), self.num_token_slots,
+                )
+                if required > tile.memory.size:
+                    overflow = (required, tile.memory.size)
+                    overflows[stage] = overflow
+                    break
+            self.stage_l1_checks[key] = overflow
+        return overflows
 
     @staticmethod
     def _add(cycles, contribution):
@@ -632,8 +734,9 @@ def allocate(
         constraints.
 
     Behavior:
-        The pass validates and classifies the graph, seeds each stage with its
-        smallest L1-feasible tile count, searches counts, layouts, and tile exchanges to improve the ordered
+        The pass validates and classifies the graph, seeds intrinsic L1-feasible
+        counts and grows seeds as needed to include receive FIFOs, then searches
+        counts, layouts, and tile exchanges to improve the ordered
         whole-plan service bottleneck. Unused tiles are permitted.
 
     Returns:

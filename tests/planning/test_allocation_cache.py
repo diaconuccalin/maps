@@ -35,6 +35,36 @@ def _cache_graph():
     return graph, {0: (first, second), 1: (joined,), 2: (final,), 3: (isolated,)}
 
 
+def test_fifo_feasibility_cache_reuses_unaffected_stage_checks(monkeypatch):
+    from maps.hardware import FIFOLayout
+
+    graph, stages = _cache_graph()
+    mesh = _mesh_with_l1(4, 4, 65536)
+    mesh = replace(mesh, tiles=tuple(replace(t, memory=replace(
+        t.memory, fifo=FIFOLayout(16, 8, 92, 4),
+    )) for t in mesh.tiles))
+    analyzer = StageCandidateAnalyzer(stages, mesh, frozenset(graph.initializers))
+    candidates = {s: analyzer.candidate(s, 1) for s in stages}
+    cache = selection.AllocationCommunicationCache(graph, mesh, {s: c.plan for s, c in candidates.items()})
+    calls = []
+    original = FIFOLayout.allocation_bytes
+
+    def count(self, payloads, slots):
+        payloads = tuple(payloads)
+        calls.append(payloads)
+        return original(self, payloads, slots)
+
+    monkeypatch.setattr(FIFOLayout, "allocation_bytes", count)
+    assert cache.l1_overflows(candidates) == {}
+    assert len(calls) == 4
+    calls.clear()
+    assert cache.l1_overflows(candidates) == {}
+    assert calls == []
+    # Stage 3 is disconnected, so only its two new tile checks are needed.
+    assert cache.l1_overflows(candidates | {3: analyzer.candidate(3, 2)}) == {}
+    assert calls == [(), ()]
+
+
 @pytest.mark.parametrize("runtime", (
     DMARuntimeCost(),
     DMARuntimeCost(submission_cycles=13, setup_cycles=7, publication_cycles=3),

@@ -66,6 +66,10 @@ class StageCandidate:
 class StageCandidateAnalyzer:
     """Lazily analyze and cache candidates within one Allocation invocation."""
 
+    @property
+    def num_token_slots(self) -> int:
+        return self._num_token_slots
+
     def __init__(
         self,
         stage_formation: StageFormation,

@@ -1,6 +1,6 @@
 """MAGIA-v3 Mesh construction and deployment memory contracts."""
 
-from maps.hardware import DMARuntimeCost, L1Memory, L2Memory, Mesh, Tile
+from maps.hardware import DMARuntimeCost, FIFOLayout, L1Memory, L2Memory, Mesh, Tile
 from maps.target.magia.mesh import (
     L1_BANDWIDTH_BYTES,
     MESH_HEIGHT,
@@ -52,7 +52,11 @@ def build_mesh(width: int = MESH_WIDTH, height: int = MESH_HEIGHT) -> Mesh:
                 tile_id=y * width + x,
                 x=x,
                 y=y,
-                memory=L1Memory(L1_USABLE_BYTES, L1_BANDWIDTH_BYTES),
+                # l1_fifo.h: header=16, ring=8, slot=12+80-byte descriptor;
+                # indexed rings additionally store one uint32 offset per ring
+                # and a terminal offset.
+                memory=L1Memory(L1_USABLE_BYTES, L1_BANDWIDTH_BYTES,
+                                FIFOLayout(16, 8, 92, 4)),
                 devices=TILE_DEVICES,
                 device_assignment=DEVICE_ASSIGNMENT,
             )

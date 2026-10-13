@@ -895,9 +895,16 @@ def test_harmful_tile_increase_leaves_tiles_unused(monkeypatch) -> None:
     assert allocate(graph, mesh, {0: (node,)})[0].tile_count == 1
 
 
-def test_tile_exchange_improves_full_mesh_objective(monkeypatch) -> None:
+@pytest.mark.parametrize("connection", ("forward", "reverse", "none"))
+def test_bottleneck_can_receive_from_any_stage(monkeypatch, connection) -> None:
     first = _gemm_node("donor", 16, 16, 16)
     second = _gemm_node("recipient", 16, 16, 16)
+    if connection == "forward":
+        second = replace(second, inputs=(first.outputs[0], second.inputs[1]),
+                         payload=replace(second.payload, x=first.outputs[0]))
+    elif connection == "reverse":
+        first = replace(first, inputs=(second.outputs[0], first.inputs[1]),
+                        payload=replace(first.payload, x=second.outputs[0]))
     graph = Graph("exchange", nodes=(first, second))
     mesh = _mesh_with_l1(3, 1, 32768)
     context = allocation_module.build_allocation_context(graph, {0: (first,), 1: (second,)})
@@ -913,6 +920,136 @@ def test_tile_exchange_improves_full_mesh_objective(monkeypatch) -> None:
     selected, evaluation = allocation_module.grow_stage_candidates(context, mesh, seeds, analyzer, 1, 1, False)
     assert tuple(c.plan.tile_count for c in selected.values()) == (1, 2)
     assert max(evaluation.metrics.values()) == 10
+
+
+@pytest.mark.parametrize("reverse,tied", ((False, False), (True, False), (False, True)))
+def test_exchange_recipients_include_bottlenecks_and_direct_io_only(monkeypatch, reverse, tied) -> None:
+    nodes = [_gemm_node(f"stage{s}", 16, 16, 16) for s in range(4)]
+    producer, consumer = (2, 1) if reverse else (1, 2)
+    node = nodes[consumer]
+    tensor = nodes[producer].outputs[0]
+    nodes[consumer] = replace(node, inputs=(tensor, node.inputs[1]),
+                              payload=replace(node.payload, x=tensor))
+    graph = Graph("recipients", nodes=tuple(nodes))
+    mesh = _mesh_with_l1(5, 1, 32768)
+    context = allocation_module.build_allocation_context(graph, {s: (n,) for s, n in enumerate(nodes)})
+    analyzer = StageCandidateAnalyzer(context.stage_formation, mesh, frozenset())
+    seeds = {s: analyzer.candidate(s, 2 if s == 0 else 1) for s in range(4)}
+    recipients = set()
+
+    def evaluate(candidates, **kwargs):
+        counts = tuple(c.plan.tile_count for c in candidates.values())
+        if counts[0] == 1:
+            recipients.update(s for s in range(1, 4) if counts[s] == 2)
+        metrics = (30 if counts[0] == 1 else 5, 20, 10, 20 if tied else 8)
+        return SelectionEvaluation({s: StageMetricBreakdown(0, 0, float(m)) for s, m in enumerate(metrics)})
+
+    monkeypatch.setattr(allocation_module, "evaluate_candidate_selection", evaluate)
+    allocation_module.grow_stage_candidates(context, mesh, seeds, analyzer, 1, 1, False)
+    assert recipients == ({1, 2, 3} if tied else {1, 2})
+
+
+def test_exchange_count_probes_retain_original_neighborhood() -> None:
+    counts = allocation_module.exchange_tile_counts(9, 8)
+    assert counts == (1, 2, 3, 4, 5, 7, 8)
+    assert allocation_module.exchange_tile_counts(1, 0) == ()
+
+
+def test_exchange_focus_stages_can_donate_and_receive(monkeypatch) -> None:
+    nodes = [_gemm_node(f"stage{s}", 16, 16, 16) for s in range(5)]
+    nodes[2] = replace(nodes[2], inputs=(nodes[1].outputs[0], nodes[2].inputs[1]),
+                       payload=replace(nodes[2].payload, x=nodes[1].outputs[0]))
+    graph = Graph("exchange_directions", nodes=tuple(nodes))
+    mesh = _mesh_with_l1(10, 1, 32768)
+    context = allocation_module.build_allocation_context(graph, {s: (n,) for s, n in enumerate(nodes)})
+    analyzer = StageCandidateAnalyzer(context.stage_formation, mesh, frozenset())
+    seeds = {s: analyzer.candidate(s, 2) for s in range(5)}
+    pairs = set()
+
+    def evaluate(candidates, **kwargs):
+        counts = {s: c.plan.tile_count for s, c in candidates.items()}
+        donors = [s for s, count in counts.items() if count < 2]
+        recipients = [s for s, count in counts.items() if count > 2]
+        if donors and recipients:
+            pairs.add((donors[0], recipients[0]))
+        # Prevent accepted changes so this observes exactly one sweep.
+        metrics = {s: (20 if s == 1 else 5) + (100 if count != 2 else 0)
+                   for s, count in counts.items()}
+        return SelectionEvaluation({s: StageMetricBreakdown(0, 0, float(m)) for s, m in metrics.items()})
+
+    monkeypatch.setattr(allocation_module, "evaluate_candidate_selection", evaluate)
+    allocation_module.grow_stage_candidates(context, mesh, seeds, analyzer, 1, 1, False)
+    assert pairs == {(donor, recipient) for donor in range(5) for recipient in range(5)
+                     if donor != recipient and ({donor, recipient} & {1, 2})}
+
+
+def test_fifo_abi_accounts_for_the_failing_mobilevit_tile() -> None:
+    from maps.hardware import FIFOLayout
+
+    fifo = FIFOLayout(16, 8, 92, 4)
+    assert fifo.allocation_bytes((131072, 256, 256, 256, 256), 2) == 265192
+    assert 525312 + fifo.allocation_bytes((131072, 256, 256, 256, 256), 2) == 790504
+    assert fifo.allocation_bytes((), 2) == 20
+    assert fifo.allocation_bytes((1,), 1) == 128
+
+
+@pytest.mark.parametrize("slots", (1, 2))
+def test_fifo_storage_rejects_tensor_feasible_candidates_and_repairs_seeds(slots) -> None:
+    from maps.hardware import FIFOLayout
+    from maps.planning.allocation.selection import AllocationCommunicationCache
+
+    producer = _gemm_node("fifo_producer", 8, 8, 8)
+    consumer = _gemm_node("fifo_consumer", 8, 8, 8)
+    consumer = replace(consumer, inputs=(producer.outputs[0], consumer.inputs[1]),
+                       payload=replace(consumer.payload, x=producer.outputs[0]))
+    graph = Graph("fifo", nodes=(producer, consumer),
+                  tensors=tuple(dict.fromkeys(producer.inputs + producer.outputs
+                                              + consumer.inputs + consumer.outputs)),
+                  initializers=(producer.inputs[1], consumer.inputs[1]),
+                  inputs=(producer.inputs[0],), outputs=consumer.outputs)
+    mesh = _mesh_with_l1(3, 1, 1024 if slots == 2 else 600)
+    mesh = replace(mesh, tiles=tuple(replace(tile, memory=replace(
+        tile.memory, fifo=FIFOLayout(16, 8, 92, 4),
+    )) for tile in mesh.tiles))
+    formation = {0: (producer,), 1: (consumer,)}
+    analyzer = StageCandidateAnalyzer(formation, mesh, frozenset(graph.initializers), slots)
+    seeds = {s: analyzer.candidate(s, 1) for s in formation}
+    assert all(c is not None for c in seeds.values())
+    cache = AllocationCommunicationCache(graph, mesh, {s: c.plan for s, c in seeds.items()}, slots)
+    assert allocation_module.evaluate_candidate_selection(seeds, mesh, 1, 1, graph, cache) is None
+    assert set(cache.l1_overflows(seeds)) == {1}
+    assert allocation_module.evaluate_candidate_selection(
+        seeds, mesh, 1, 1, graph, num_token_slots=slots,
+    ) is None
+    from maps.planning import ExecutionContract, PlanningConstraints, validate_execution_plan
+    from maps.planning.execution_plan import construct_execution_plan, estimate_stage_l1_memory_for_tile
+    from maps.planning.placement.regions import placements_from_regions
+    from maps.planning.transitions import build_virtual_transitions
+
+    seed_plans = {s: c.plan for s, c in seeds.items()}
+    placements = placements_from_regions(mesh, seed_plans, {0: {0}, 1: {1}})
+    plan = construct_execution_plan(
+        graph, mesh, seed_plans, placements, build_virtual_transitions(graph, seed_plans),
+        execution=ExecutionContract(num_token_slots=slots),
+    )
+    required = estimate_stage_l1_memory_for_tile(plan.stages[1], plan, mesh.tiles[1])
+    assert required == cache.l1_overflows(seeds)[1][0]
+    assert any(v.kind == "tile_l1_capacity_exceeded"
+               for v in validate_execution_plan(plan, PlanningConstraints()).violations)
+    plans = allocation_module.allocate(graph, mesh, formation, num_token_slots=slots)
+    assert plans[1].tile_count == 2
+
+    if slots == 2:
+        # Changing the producer's layout/count also changes the receiver's
+        # ring count, even when the receiver allocation is untouched.
+        roomy = replace(mesh, tiles=tuple(replace(tile, memory=replace(tile.memory, size=1120))
+                                         for tile in mesh.tiles))
+        analyzer = StageCandidateAnalyzer(formation, roomy, frozenset(graph.initializers), slots)
+        single = {s: analyzer.candidate(s, 1) for s in formation}
+        memory_cache = AllocationCommunicationCache(graph, roomy, {s: c.plan for s, c in single.items()}, slots)
+        assert allocation_module.evaluate_candidate_selection(single, roomy, 1, 1, graph, memory_cache) is not None
+        split = next(c for c in analyzer.candidates(0, 2) if c.plan.logical_shape == (2, 1))
+        assert allocation_module.evaluate_candidate_selection(single | {0: split}, roomy, 1, 1, graph, memory_cache) is None
 
 
 def test_stage_service_adds_intrinsic_and_transfer_cycles(monkeypatch) -> None:
@@ -983,7 +1120,7 @@ def test_slice_lookup_does_not_resolve_the_whole_submesh_per_tile(
     assert calls <= len(tiles)
 
 
-def test_large_mesh_probes_a_logarithmic_count_neighborhood(monkeypatch) -> None:
+def test_large_mesh_limits_count_search_to_double_current(monkeypatch) -> None:
     node, initializer = _plateau_node("count_search", 10, 10)
     graph = Graph("count_search", nodes=(node,), initializers=(initializer,))
     mesh = _mesh_with_l1(16, 16, l1_size=4096)
@@ -1001,5 +1138,10 @@ def test_large_mesh_probes_a_logarithmic_count_neighborhood(monkeypatch) -> None
         context, mesh, {0: seed}, analyzer, 1, 1, False,
     )
     assert selected[0] is seed
-    assert {1, 2, 3, 4, 8, 16, 32, 64, 128, 256} <= set(probed)
-    assert len(probed) <= 3 * mesh.num_tiles.bit_length() + 4
+    assert probed == [1, 2]
+
+
+def test_count_search_includes_gaps_and_respects_available_tiles() -> None:
+    assert allocation_module.candidate_tile_counts(3, 100) == (1, 2, 3, 4, 5, 6)
+    assert allocation_module.candidate_tile_counts(4, 6) == (1, 2, 3, 4, 5, 6)
+    assert allocation_module.candidate_tile_counts(1, 0) == ()

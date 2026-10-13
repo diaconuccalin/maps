@@ -43,7 +43,8 @@ def place(
         The pass analyzes virtual traffic, constructs a feasible initial set of
         connected regions, assigns communication-aware virtual ownership,
         compares compact and full-mesh seeds using analytical stage service
-        estimates, and sweeps strictly improving local repairs across all stages.
+        estimates, and searches strictly improving local repairs focused on
+        bottleneck stages and their direct I/O neighbors.
 
     Raises:
         ValueError: If requested stage tiles exceed the mesh or no connected

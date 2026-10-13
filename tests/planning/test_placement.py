@@ -1,4 +1,5 @@
 import pytest
+from dataclasses import replace
 
 from maps.hardware import L2Memory, Mesh
 from maps.graph import Edge, Graph, Node, OpKind, TensorDType, decompose_graph
@@ -87,6 +88,58 @@ def test_initial_placement_uses_serpentine_fallback_for_sparse_allocation(
         *(placement.physical_submesh.tile_ids for placement in placements.values())
     )
     assert len(placed_tile_ids) == 4
+
+
+def test_repair_focus_includes_tied_bottlenecks_and_direct_io(monkeypatch) -> None:
+    mesh = _test_mesh(5, 1)
+    plans = {s: _single_node_stage_plan(mesh, s, _gemm_node(f"stage{s}"), {0})
+             for s in range(5)}
+    placements = placement_topology.placements_from_regions(
+        mesh, plans, {s: {s} for s in plans},
+    )
+    traffic = replace(build_virtual_traffic((), plans), stage_comm={(0, 1): 1, (2, 0): 1})
+    evaluator = PlacementEvaluator(mesh, plans, ())
+    initial = evaluator.evaluate(placements)
+    initial = replace(initial, stage_breakdowns={
+        s: replace(b, weighted_bottleneck=20 if s in {0, 3} else 10)
+        for s, b in initial.stage_breakdowns.items()
+    })
+    visited = []
+
+    def choose(mesh, placements, traffic, evaluation, worst):
+        visited.append(worst.stage_id)
+        return []
+
+    monkeypatch.setattr(placement_repair, "choose_repair_regions", choose)
+    assert placement_repair.improve_placement(
+        mesh, plans, placements, traffic, (), initial, False, evaluator=evaluator,
+    ) == placements
+    assert visited == [0, 3, 1, 2]
+
+
+def test_repair_reuses_evaluation_for_unchanged_ownership(monkeypatch) -> None:
+    from maps.planning.placement.evaluation import RepairCandidate
+
+    mesh = _test_mesh(2, 1)
+    plans = {s: _single_node_stage_plan(mesh, s, _gemm_node(f"stage{s}"), {0})
+             for s in range(2)}
+    placements = placement_topology.placements_from_regions(mesh, plans, {0: {0}, 1: {1}})
+    traffic = build_virtual_traffic((), plans)
+    evaluator = PlacementEvaluator(mesh, plans, ())
+    initial = evaluator.evaluate(placements)
+    monkeypatch.setattr(placement_repair, "choose_repair_regions", lambda *args: [
+        RepairCandidate(frozenset({0, 1}), 1, "duplicate"),
+    ])
+    monkeypatch.setattr(placement_repair, "repair_region", lambda *args, **kwargs: dict(placements))
+    monkeypatch.setattr(placement_repair, "assign_stage_ownerships", lambda *args, **kwargs: dict(placements))
+
+    def unexpected_evaluation(*args, **kwargs):
+        pytest.fail("identical ownership should reuse the current evaluation")
+
+    monkeypatch.setattr(evaluator, "evaluate", unexpected_evaluation)
+    assert placement_repair.improve_placement(
+        mesh, plans, placements, traffic, (), initial, False, evaluator=evaluator,
+    ) == placements
 
 
 def _test_mesh(width: int, height: int) -> Mesh:
@@ -310,7 +363,7 @@ def test_repair_region_skips_an_infeasible_growth_attempt(monkeypatch) -> None:
     ) is None
 
 
-@pytest.mark.parametrize("compute_weight", [1.0, 100.0])
+@pytest.mark.parametrize("compute_weight", [0.1, 100.0])
 def test_repair_moves_an_isolated_stage_into_unused_tiles_nearer_l2(compute_weight) -> None:
     mesh = _test_mesh(6, 3)
     producer = _gemm_node("producer")
@@ -337,11 +390,18 @@ def test_repair_moves_an_isolated_stage_into_unused_tiles_nearer_l2(compute_weig
     if compute_weight == 100.0:
         # The worst stage has no traffic and cannot improve.
         assert initial.tile_scores[initial.worst_tile_id].stage_id == 1
+    else:
+        assert initial.tile_scores[initial.worst_tile_id].stage_id == 0
 
     repaired = placement_repair.improve_placement(
         mesh, plans, placements, traffic, transitions, initial, False,
         evaluator=evaluator,
     )
+
+    if compute_weight == 100.0:
+        # The isolated non-bottleneck is outside the focused repair search.
+        assert repaired == placements
+        return
 
     assert evaluator.evaluate(repaired).objective < initial.objective
     assert repaired[1] is placements[1]

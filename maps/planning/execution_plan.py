@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 import re
 from typing import cast
 
@@ -229,6 +230,21 @@ class ExecutionPlan:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("execution plan name must not be empty")
+
+    @cached_property
+    def fifo_payload_bytes_by_tile(self) -> dict[int, tuple[int, ...]]:
+        """Index receive-ring payloads once for per-tile L1 validation."""
+
+        payloads: dict[int, list[int]] = {}
+        for transition in self.transitions:
+            if not isinstance(transition, IntermediateTransition):
+                continue
+            elem_bytes = self.tensors[transition.tensor_id].elem_bytes
+            for transfer in transition.transfers:
+                payloads.setdefault(transfer.destination_tile_id, []).append(
+                    transfer.destination_subslice.num_elements * elem_bytes,
+                )
+        return {tile: tuple(sizes) for tile, sizes in payloads.items()}
 
 
 @dataclass(frozen=True)
@@ -691,7 +707,13 @@ def estimate_stage_l1_memory_for_tile(
         ),
         default=0,
     )
-    return stage_l1_allocation_bytes(permanent_l1_bytes, scratch_l1_bytes)
+    required = stage_l1_allocation_bytes(permanent_l1_bytes, scratch_l1_bytes)
+    if tile.memory.fifo is not None:
+        required += tile.memory.fifo.allocation_bytes(
+            execution_plan.fifo_payload_bytes_by_tile.get(tile.tile_id, ()),
+            execution_plan.execution.num_token_slots,
+        )
+    return required
 
 
 def estimate_stage_l2_memory(

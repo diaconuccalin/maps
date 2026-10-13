@@ -16,7 +16,7 @@ from .device import (
     WorkSignature,
     same_dtype_signatures,
 )
-from .memory import L1Memory, L2Memory
+from .memory import FIFOLayout, L1Memory, L2Memory
 from .mesh import Mesh, print_mesh
 from .noc import (
     EndpointKind,
@@ -33,6 +33,7 @@ from .noc import (
 from .tile import Tile
 
 __all__ = [
+    "FIFOLayout",
     "CollectiveCost",
     "DMARuntimeCost",
     "DMADevice",

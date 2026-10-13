@@ -741,3 +741,45 @@ def test_generated_magia_v3_application_executes_multiple_tile_local_spatz_tasks
     assert "incompatible Spatz task-bundle ABI" in (
         incompatible.stdout + incompatible.stderr
     )
+
+
+def test_generated_magia_v3_sigmoid_bundles_its_spatz_task(tmp_path: Path) -> None:
+    model_path = tmp_path / 'sigmoid.onnx'
+    graph = helper.make_graph(
+        [helper.make_node('Sigmoid', ['input'], ['output'])],
+        'sigmoid',
+        [helper.make_tensor_value_info('input', TensorProto.FLOAT16, [1, 8])],
+        [helper.make_tensor_value_info('output', TensorProto.FLOAT16, [1, 8])],
+    )
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid('', 17)]), model_path)
+    application = tmp_path / 'application'
+    assert main(['build', str(model_path), '--target', 'magia-v3', '--mesh', '1x1',
+                 '--token-slots', '1', '--output', str(application)]) == 0
+    assert validate_application(application)['tasks'] == ['sigmoid_fp16_spatz_task']
+    cmake = (application / 'CMakeLists.txt').read_text()
+    assert cmake.count('sigmoid_fp16_spatz_task.c') == 1
+    runner = (application / 'src/sigmoid_runner.c').read_text()
+    assert 'runtime.sigmoid_fp16_task = SIGMOID_FP16_SPATZ_TASK' in runner
+    assert 'MAPS_HAS_SIGMOID_SPATZ_TASK=1' in cmake
+
+
+def test_generated_magia_v3_depthwise_bundles_its_spatz_task(tmp_path: Path) -> None:
+    model_path = tmp_path / 'depthwise.onnx'
+    graph = helper.make_graph(
+        [helper.make_node('Conv', ['input', 'weight'], ['output'], group=2,
+                          kernel_shape=[3, 3], pads=[1, 1, 1, 1])],
+        'depthwise',
+        [helper.make_tensor_value_info('input', TensorProto.FLOAT16, [1, 2, 8, 8])],
+        [helper.make_tensor_value_info('output', TensorProto.FLOAT16, [1, 2, 8, 8])],
+        [helper.make_tensor('weight', TensorProto.FLOAT16, [2, 1, 3, 3], [0.25] * 18)],
+    )
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid('', 17)]), model_path)
+    application = tmp_path / 'application'
+    assert main(['build', str(model_path), '--target', 'magia-v3', '--mesh', '1x1',
+                 '--token-slots', '1', '--output', str(application)]) == 0
+    assert validate_application(application)['tasks'] == ['depthwise_conv_fp16_spatz_task']
+    cmake = (application / 'CMakeLists.txt').read_text()
+    assert cmake.count('depthwise_conv_fp16_spatz_task.c') == 1
+    runner = (application / 'src/depthwise_runner.c').read_text()
+    assert 'runtime.depthwise_conv_fp16_task = DEPTHWISE_CONV_FP16_SPATZ_TASK' in runner
+    assert 'MAPS_HAS_DEPTHWISE_CONV_SPATZ_TASK=1' in cmake
